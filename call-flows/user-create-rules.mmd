@@ -1,0 +1,18 @@
+sequenceDiagram
+    participant User
+    participant Gateway
+    participant StrategyService as algoshare-strategy
+    participant DB as Strategy DB (Mongo/Postgres)
+    participant Redis
+
+    User->>Gateway: POST /strategies { "condition": "RSI < 30", "symbol": "BTC" }
+    Gateway->>StrategyService: Forward Request
+    StrategyService->>StrategyService: Validate Logic
+    StrategyService->>DB: Save Strategy (Status: DRAFT)
+    StrategyService-->>User: 201 Created (ID: strat_001)
+
+    User->>Gateway: POST /strategies/strat_001/activate
+    Gateway->>StrategyService: Forward Request
+    StrategyService->>DB: Update Status -> ACTIVE
+    StrategyService->>Redis: ADD to "Active_Strategies_List"
+    StrategyService-->>User: 200 OK "Strategy Running"

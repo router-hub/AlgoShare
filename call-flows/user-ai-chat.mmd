@@ -1,0 +1,17 @@
+sequenceDiagram
+    participant Client
+    participant Gateway
+    participant AI as algoshare-ai
+    participant Order as algoshare-order
+    participant LLM as External AI
+
+    Client->>Gateway: POST /api/ai/chat "Why did trade #123 fail?"
+    Gateway->>Gateway: Rate Limit Check
+    Gateway->>AI: Forward Request
+
+    AI->>Order: GET /orders/123 (Fetch details)
+    Order-->>AI: {status: REJECTED, reason: No Funds}
+
+    AI->>LLM: Generate Explanation
+    LLM-->>AI: "The trade failed due to insufficient balance..."
+    AI-->>Client: 200 OK + Explanation

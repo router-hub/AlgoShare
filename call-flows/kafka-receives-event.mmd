@@ -1,0 +1,47 @@
+sequenceDiagram
+    participant Binance
+    participant Ingestion as algoshare-ingestion
+    participant Kafka
+    participant Strategy as algoshare-strategy
+    participant Order as algoshare-order
+    participant UserService as algoshare-user-payment
+    participant Exchange as External Broker
+
+    Note over Binance, Ingestion: 1. Market Data Ingestion
+    Binance->>Ingestion: Price Tick (BTC $50,000)
+    Ingestion->>Kafka: Publish MarketTick
+
+    Note over Kafka, Strategy: 2. Strategy Evaluation
+    Kafka->>Strategy: Consume Tick
+    Strategy->>Strategy: Check Redis for Active Rules
+    Strategy->>Strategy: Rule Match! (RSI < 30)
+    Strategy->>Kafka: Publish SignalEvent {User: A, Action: BUY, Amt: $100}
+
+    Note over Kafka, Order: 3. Order Processing
+    Kafka->>Order: Consume SignalEvent
+
+    Note over Order, UserService: 4. Payment Lock (Critical Step)
+    Order->>UserService: SYNC POST /wallet/lock {userId, amount: $100}
+
+    alt Funds Available
+        UserService-->>Order: 200 OK (LockID: 999)
+
+        Note over Order, Exchange: 5. Execution
+        Order->>Exchange: Place Buy Order
+
+        alt Order Filled
+            Exchange-->>Order: Success (Filled)
+            Order->>UserService: POST /wallet/commit {lockId: 999}
+            UserService->>UserService: Deduct Balance Permanently
+            Order->>Order: Update Status: COMPLETED
+        else Order Rejected/Failed
+            Exchange-->>Order: Failed
+            Order->>UserService: POST /wallet/release {lockId: 999}
+            UserService->>UserService: Unlock Funds
+            Order->>Order: Update Status: FAILED
+        end
+
+    else Insufficient Funds
+        UserService-->>Order: 402 Payment Required
+        Order->>Order: Log Error "No Funds"
+    end

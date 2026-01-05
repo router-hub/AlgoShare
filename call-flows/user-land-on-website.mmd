@@ -1,0 +1,25 @@
+sequenceDiagram
+    actor User
+    participant Browser
+    participant Gateway as API Gateway
+    participant Socket as WebSocket Svc
+    participant Redis
+
+    User->>Browser: Opens algoshare.com
+    Browser->>Gateway: GET /index.html (React App)
+    Gateway-->>Browser: Returns JS/CSS Bundles
+    
+    rect rgb(240, 248, 255)
+        note right of Browser: Real-Time Connection
+        Browser->>Gateway: WebSocket Handshake (ws://api/ws)
+        Gateway->>Socket: Upgrade Request
+        Socket-->>Browser: Connection Established (101 Switching Protocols)
+    end
+
+    Browser->>Socket: SUBSCRIBE /topic/global-market
+    
+    loop Every 100ms
+        Redis->>Socket: Fetch latest BTC Price
+        Socket-->>Browser: Push Price Update (BTC: $98,000)
+        Browser-->>User: Flashes Green/Red on UI
+    end

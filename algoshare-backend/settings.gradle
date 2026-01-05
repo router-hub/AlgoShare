@@ -1,0 +1,8 @@
+rootProject.name = "algoshare-backend"
+include "algoshare-gateway"
+include "algoshare-auth"
+include "algoshare-ai"
+include "algoshare-order"
+include "algoshare-strategy"
+include "algoshare-user-payment"
+include "algoshare-ingestion"

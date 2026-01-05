@@ -1,0 +1,35 @@
+%% Registration Flow
+%% User signs up for a new account.
+sequenceDiagram
+    participant Client
+    participant Gateway as algoshare-gateway
+    participant Auth as algoshare-auth
+    participant Kafka
+    participant UserService as algoshare-user-payment
+
+    Client->>Gateway: POST /auth/register
+    Gateway->>Auth: Route Request
+    Auth->>Auth: Save Creds (Postgres)
+    Auth->>Kafka: Publish UserCreatedEvent
+    Auth-->>Gateway: 201 Created (Pending)
+    Gateway-->>Client: "Account Created. Please Login."
+
+    par Async Wallet Creation
+        Kafka->>UserService: Consume UserCreatedEvent
+        UserService->>UserService: Create Wallet (Balance: $0)
+    end
+
+%% Login Flow
+%% User authenticates and receives an access token.
+    participant Client
+    participant Gateway as algoshare-gateway
+    participant Auth as algoshare-auth
+    participant DB as Auth DB
+
+    Client->>Gateway: POST /auth/login
+    Gateway->>Auth: Forward Credentials
+    Auth->>DB: Verify Password Hash
+    DB-->>Auth: Valid
+    Auth->>Auth: Generate JWT (RS256)
+    Auth-->>Gateway: Return Token
+    Gateway-->>Client: 200 OK + Bearer Token
