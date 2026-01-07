@@ -1,8 +1,14 @@
-rootProject.name = "algoshare-backend"
-include "algoshare-gateway"
-include "algoshare-auth"
-include "algoshare-ai"
-include "algoshare-order"
-include "algoshare-strategy"
-include "algoshare-user-payment"
-include "algoshare-ingestion"
+rootProject.name = 'algoshare-platform'
+
+// Core Modules defined in RAD 2.0
+include 'algoshare-ingestion'      // Market Data
+include 'algoshare-strategy'       // Rules Engine
+include 'algoshare-order'          // Execution & Locking
+include 'algoshare-user-payment'   // Wallet & Stripe
+include 'algoshare-auth'           // Identity & JWT
+include 'algoshare-gateway'        // Entry Point
+include 'algoshare-ai'             // Financial Assistant
+include 'algoshare-discovery'      // Server Discovery
+
+// Optional: Common library for shared DTOs/Events
+include 'algoshare-common'

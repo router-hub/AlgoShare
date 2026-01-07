@@ -1,0 +1,578 @@
+# ============================================================================
+# ALGOSHARE GATEWAY - Production Configuration
+# ============================================================================
+# Architecture: Central entry point for all external traffic
+# Security: JWT validation via OAuth2 Resource Server
+# Resilience: Circuit Breakers + Rate Limiting + Fallbacks
+# Author: AlgoShare Team
+# Last Updated: January 8, 2026
+# ============================================================================
+
+server:
+  port: 8081
+  shutdown: graceful
+  netty:
+    connection-timeout: 10s
+    idle-timeout: 60s
+
+# ============================================================================
+# Spring Application Configuration
+# ============================================================================
+spring:
+  application:
+    name: algoshare-gateway
+
+  # --------------------------------------------------------------------------
+  # Redis Configuration (Distributed Rate Limiting)
+  # --------------------------------------------------------------------------
+  # Interview QA: "Why Redis for Rate Limiting?"
+  # A: "For distributed systems with multiple Gateway instances, Redis provides
+  #     shared state. All replicas see the same token bucket counters via Lua
+  #     scripts, ensuring consistent rate limits regardless of which Gateway
+  #     instance handles the request. The atomic Lua execution prevents race
+  #     conditions across distributed instances."
+  # --------------------------------------------------------------------------
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2000ms
+      database: 0
+      lettuce:
+        pool:
+          max-active: 20
+          max-idle: 10
+          min-idle: 5
+          max-wait: 2000ms
+        shutdown-timeout: 100ms
+
+  # --------------------------------------------------------------------------
+  # OAuth2 Resource Server (JWT Validation)
+  # --------------------------------------------------------------------------
+  # Interview QA: "How does the Gateway validate JWTs without calling Auth Service?"
+  # A: "The Gateway fetches the issuer's OIDC metadata from 
+  #     /.well-known/openid-configuration, retrieves the JWK Set (public keys),
+  #     and verifies JWT signatures locally using RS256 algorithm. This is
+  #     stateless verification - no database or network call needed per request.
+  #     The public keys are cached and periodically refreshed."
+  # --------------------------------------------------------------------------
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${AUTH_ISSUER_URI:http://localhost:8085}
+          # Automatically discovers:
+          # - JWK Set URI: {issuer-uri}/.well-known/jwks.json
+          # - Claims validation (iss, exp, nbf)
+
+  # --------------------------------------------------------------------------
+  # Spring Cloud Gateway Routes
+  # --------------------------------------------------------------------------
+  # Interview QA: "Explain the Gateway's routing strategy"
+  # A: "Each route uses predicates to match incoming requests (Path, Method,
+  #     Headers) and applies filters for cross-cutting concerns (Authentication,
+  #     Rate Limiting, Circuit Breaking). The 'lb://' URI scheme enables client-side
+  #     load balancing across service instances registered with service discovery.
+  #     Filters execute in order: Global → Route-specific → Default."
+  # --------------------------------------------------------------------------
+  cloud:
+    gateway:
+      # ----------------------------------------------------------------------
+      # Global CORS Configuration
+      # ----------------------------------------------------------------------
+      globalcors:
+        add-to-simple-url-handler-mapping: true
+        cors-configurations:
+          '[/**]':
+            allowedOrigins:
+              - "http://localhost:3000"        # React dev server
+              - "http://localhost:3001"        # React prod build
+              - "https://algoshare.io"         # Production domain
+              - "https://www.algoshare.io"
+            allowedMethods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - PATCH
+              - OPTIONS
+            allowedHeaders:
+              - "*"
+            exposedHeaders:
+              - X-RateLimit-Limit
+              - X-RateLimit-Remaining
+              - X-RateLimit-Reset
+              - Retry-After
+            allowCredentials: true
+            maxAge: 3600
+
+      # ----------------------------------------------------------------------
+      # Default Filters (Applied to ALL routes)
+      # ----------------------------------------------------------------------
+      default-filters:
+        - DedupeResponseHeader=Access-Control-Allow-Origin Access-Control-Allow-Credentials, RETAIN_UNIQUE
+        - name: Retry
+          args:
+            retries: 3
+            statuses: BAD_GATEWAY,SERVICE_UNAVAILABLE
+            methods: GET,POST
+            backoff:
+              firstBackoff: 50ms
+              maxBackoff: 500ms
+              factor: 2
+              basedOnPreviousValue: false
+
+      # ----------------------------------------------------------------------
+      # Route Definitions
+      # ----------------------------------------------------------------------
+      routes:
+        # ====================================================================
+        # Route 1: Auth Service (Public - No Rate Limiting)
+        # ====================================================================
+        # Endpoints: /auth/register, /auth/login, /auth/refresh
+        # Security: Public (JWT not required)
+        # Requirements: FR-5 (Identity Provider)
+        # ====================================================================
+        - id: auth-service
+          uri: lb://algoshare-auth
+          predicates:
+            - Path=/auth/**
+          filters:
+            - StripPrefix=0
+            - name: CircuitBreaker
+              args:
+                name: auth-cb
+                fallbackUri: forward:/fallback/auth
+          metadata:
+            response-timeout: 5000
+            connect-timeout: 3000
+
+        # ====================================================================
+        # Route 2: User Payment Service (CRITICAL - Money Operations)
+        # ====================================================================
+        # Endpoints: /api/user-payment/wallet, /api/user-payment/deposit
+        # Security: JWT Required
+        # Requirements: FR-4 (Wallet Management, Stripe Integration, Fund Locking)
+        # Rate Limit: 100 requests/minute (moderate)
+        # Circuit Breaker: Strict (money operations, fail closed)
+        # ====================================================================
+        - id: user-payment-service
+          uri: lb://algoshare-user-payment
+          predicates:
+            - Path=/api/user-payment/**
+          filters:
+            - name: RedisRateLimit
+              args:
+                name: payment-limiter
+                capacity: 100
+                refillRate: 1.66              # 100 per minute
+                tokensPerRequest: 1
+                ttl: 120
+                failOpen: false               # CRITICAL: Don't allow on Redis failure
+
+            - name: AlgoShareCircuitBreaker
+              args:
+                name: payment-cb
+                failureThreshold: 5
+                resetTimeout: 10000           # 10 seconds
+                slowCallThreshold: 300        # 300ms
+                successThreshold: 3
+                slidingWindowSize: 20
+                halfOpenPermits: 3
+                fallbackUri: forward:/fallback/payment
+          metadata:
+            response-timeout: 5000
+
+        # ====================================================================
+        # Route 3: Order Execution Service (CRITICAL - Trading Operations)
+        # ====================================================================
+        # Endpoints: /api/order/execute, /api/order/portfolio, /api/order/history
+        # Security: JWT Required
+        # Requirements: FR-3 (Signal Processing, Two-Phase Fund Locking, Portfolio)
+        #               NFR-2 (<50ms tick-to-signal latency)
+        # Rate Limit: 200 requests/minute (high - automated trading)
+        # Circuit Breaker: Very strict (3 failures, 5s timeout)
+        # ====================================================================
+        - id: order-service
+          uri: lb://algoshare-order
+          predicates:
+            - Path=/api/order/**
+          filters:
+            - name: RedisRateLimit
+              args:
+                name: order-limiter
+                capacity: 200
+                refillRate: 3.33              # 200 per minute
+                tokensPerRequest: 1
+                ttl: 120
+                failOpen: false               # CRITICAL: Trading operations
+
+            - name: AlgoShareCircuitBreaker
+              args:
+                name: order-cb
+                failureThreshold: 3           # Low tolerance
+                resetTimeout: 5000            # 5 seconds (quick recovery)
+                slowCallThreshold: 200        # 200ms max (NFR-2 requirement)
+                successThreshold: 3
+                slidingWindowSize: 20
+                halfOpenPermits: 2
+                fallbackUri: forward:/fallback/order
+          metadata:
+            response-timeout: 3000
+            connect-timeout: 1000
+
+        # ====================================================================
+        # Route 4: AI Financial Assistant (EXPENSIVE - LLM API)
+        # ====================================================================
+        # Endpoints: /api/ai/chat, /api/ai/summary, /api/ai/train
+        # Security: JWT Required
+        # Requirements: FR-6.4 (10 requests/minute rate limit)
+        #               FR-7 (Context-aware chat, Market summaries)
+        # Rate Limit: STRICT (prevent abuse of expensive LLM API)
+        # Circuit Breaker: Relaxed (external API can be slow, 5-10s acceptable)
+        # ====================================================================
+        - id: ai-service-chat
+          uri: lb://algoshare-ai
+          predicates:
+            - Path=/api/ai/chat/**,/api/ai/summary/**
+          filters:
+            # FR-6.4: AI Chat limited to 10/minute
+            - name: RedisRateLimit
+              args:
+                name: ai-chat-limiter
+                capacity: 10
+                refillRate: 0.166             # 10 per minute = 0.166/sec
+                tokensPerRequest: 1
+                ttl: 120
+                failOpen: true                # Allow on Redis failure (not critical)
+
+            - name: AlgoShareCircuitBreaker
+              args:
+                name: ai-chat-cb
+                failureThreshold: 5           # Relaxed (external LLM can be slow)
+                resetTimeout: 30000           # 30 seconds
+                slowCallThreshold: 5000       # 5 seconds (LLM responses take time)
+                successThreshold: 2
+                slidingWindowSize: 20
+                halfOpenPermits: 3
+                fallbackUri: forward:/fallback/ai
+          metadata:
+            response-timeout: 10000           # 10 seconds for LLM
+
+        # AI Training Endpoint (Very Expensive - Different Rate Limit)
+        - id: ai-service-training
+          uri: lb://algoshare-ai
+          predicates:
+            - Path=/api/ai/train/**
+          filters:
+            # Much stricter: 5 requests per minute, each costs 5 tokens
+            - name: RedisRateLimit
+              args:
+                name: ai-training-limiter
+                capacity: 5
+                refillRate: 0.083             # 5 per minute
+                tokensPerRequest: 5           # Each training request costs 5 tokens!
+                ttl: 300                      # 5 minutes TTL
+                failOpen: false               # Don't allow on errors (very expensive)
+
+            - name: AlgoShareCircuitBreaker
+              args:
+                name: ai-training-cb
+                failureThreshold: 3
+                resetTimeout: 60000           # 1 minute
+                slowCallThreshold: 10000      # 10 seconds
+                successThreshold: 2
+                halfOpenPermits: 2
+                fallbackUri: forward:/fallback/ai
+          metadata:
+            response-timeout: 30000           # 30 seconds for training
+
+        # ====================================================================
+        # Route 5: Strategy Service (HIGH FREQUENCY - Tick Processing)
+        # ====================================================================
+        # Endpoints: /api/strategy/create, /api/strategy/activate, /api/strategy/list
+        # Security: JWT Required
+        # Requirements: FR-2 (Rule Creation, Redis Hot Cache, Kafka Consumption)
+        #               NFR-2 (<50ms tick processing)
+        # Rate Limit: 1000 requests/minute (very high - continuous tick processing)
+        # Circuit Breaker: Moderate (high tolerance for high frequency)
+        # ====================================================================
+        - id: strategy-service
+          uri: lb://algoshare-strategy
+          predicates:
+            - Path=/api/strategy/**
+          filters:
+            - name: RedisRateLimit
+              args:
+                name: strategy-limiter
+                capacity: 1000
+                refillRate: 16.66             # 1000 per minute
+                tokensPerRequest: 1
+                ttl: 120
+                failOpen: true                # Don't block on Redis failure
+
+            - name: AlgoShareCircuitBreaker
+              args:
+                name: strategy-cb
+                failureThreshold: 10          # High tolerance (high frequency)
+                resetTimeout: 10000           # 10 seconds
+                slowCallThreshold: 100        # 100ms (must be fast for NFR-2)
+                successThreshold: 3
+                slidingWindowSize: 50
+                halfOpenPermits: 5
+                fallbackUri: forward:/fallback/strategy
+          metadata:
+            response-timeout: 2000
+
+        # ====================================================================
+        # Route 6A: Market Data Ingestion (INTERNAL - Not Exposed)
+        # ====================================================================
+        # Purpose: WebSocket ingestion FROM Binance, Kafka production
+        # Requirements: FR-1 (Real-time feed, >1000 events/sec)
+        # Note: Internal service only (not accessible from frontend)
+        # ====================================================================
+        - id: ingestion-service-internal
+          uri: lb://algoshare-ingestion
+          predicates:
+            - Path=/internal/ingestion/**
+          filters:
+            - name: AlgoShareCircuitBreaker
+              args:
+                name: ingestion-cb
+                failureThreshold: 20          # Very high tolerance
+                resetTimeout: 5000
+                slowCallThreshold: 50         # Must be very fast
+                successThreshold: 5
+                halfOpenPermits: 10
+          metadata:
+            response-timeout: 1000
+
+        # ====================================================================
+        # Route 6B: Market Data Query (PUBLIC - Frontend Consumption)
+        # ====================================================================
+        # Endpoints: /api/market/price/{symbol}, /api/market/prices
+        # Security: Public (no JWT required for read-only market data)
+        # Purpose: Serve latest prices to frontend dashboards
+        # Rate Limit: 1000 requests/minute (high - dashboard polling)
+        # ====================================================================
+        - id: market-data-rest
+          uri: lb://algoshare-market-data
+          predicates:
+            - Path=/api/market/price/**,/api/market/prices/**
+          filters:
+            # IP-based rate limiting (public endpoint)
+            - name: RedisRateLimit
+              args:
+                name: market-data-limiter
+                capacity: 1000                # High throughput for dashboards
+                refillRate: 16.66             # 1000 per minute
+                tokensPerRequest: 1
+                ttl: 60
+                failOpen: true                # Non-critical, fail open
+
+            - name: AlgoShareCircuitBreaker
+              args:
+                name: market-data-cb
+                failureThreshold: 10
+                resetTimeout: 5000
+                slowCallThreshold: 100
+                successThreshold: 3
+                halfOpenPermits: 5
+          metadata:
+            response-timeout: 2000
+
+        # ====================================================================
+        # Route 6C: Market Data WebSocket (REAL-TIME STREAMING)
+        # ====================================================================
+        # Endpoint: /api/market/stream/{symbol}
+        # Purpose: WebSocket connection for live price updates to frontend
+        # Frontend: ws://gateway:8081/api/market/stream/BTCUSDT
+        # Rate Limit: Connection-based (no per-request limit)
+        # ====================================================================
+        - id: market-data-websocket
+          uri: lb:ws://algoshare-market-data
+          predicates:
+            - Path=/api/market/stream/**
+          filters:
+            # No rate limiting (connection-based throttling at service level)
+            - name: AlgoShareCircuitBreaker
+              args:
+                name: market-ws-cb
+                failureThreshold: 5
+                resetTimeout: 10000
+                slowCallThreshold: 200
+                successThreshold: 2
+                halfOpenPermits: 3
+          metadata:
+            response-timeout: 30000           # Long timeout for WebSocket
+
+        # ====================================================================
+        # Fallback Routes (Circuit Breaker Open)
+        # ====================================================================
+        - id: fallback-auth
+          uri: forward:/fallback/auth
+          predicates:
+            - Path=/fallback/auth
+
+        - id: fallback-payment
+          uri: forward:/fallback/payment
+          predicates:
+            - Path=/fallback/payment
+
+        - id: fallback-order
+          uri: forward:/fallback/order
+          predicates:
+            - Path=/fallback/order
+
+        - id: fallback-ai
+          uri: forward:/fallback/ai
+          predicates:
+            - Path=/fallback/ai
+
+        - id: fallback-strategy
+          uri: forward:/fallback/strategy
+          predicates:
+            - Path=/fallback/strategy
+
+      # ----------------------------------------------------------------------
+      # Gateway Metrics Configuration
+      # ----------------------------------------------------------------------
+      metrics:
+        enabled: true
+
+      # ----------------------------------------------------------------------
+      # HTTP Client Configuration
+      # ----------------------------------------------------------------------
+      httpclient:
+        connect-timeout: 3000
+        response-timeout: 5s
+        pool:
+          type: elastic
+          max-connections: 500
+          max-idle-time: 60s
+        wiretap: true                        # Enable request/response logging
+
+# ============================================================================
+# Management & Observability (Actuator)
+# ============================================================================
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,gateway,circuitbreakers,ratelimiters
+      base-path: /actuator
+
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+    gateway:
+      enabled: true                          # /actuator/gateway/routes
+
+  health:
+    redis:
+      enabled: true
+    circuitbreakers:
+      enabled: true
+    ratelimiters:
+      enabled: true
+
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+      environment: ${ENVIRONMENT:development}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+
+  # Graceful Shutdown
+  server:
+    shutdown: graceful
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+logging:
+  level:
+    root: INFO
+    org.springframework.cloud.gateway: DEBUG
+    org.springframework.security: DEBUG
+    org.springframework.web.reactive: DEBUG
+    com.algoshare.gateway: DEBUG
+    reactor.netty: INFO
+    io.lettuce.core: INFO
+
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+
+  file:
+    name: logs/gateway.log
+    max-size: 10MB
+    max-history: 30
+    total-size-cap: 1GB
+
+# ============================================================================
+# Environment-Specific Overrides
+# ============================================================================
+# These can be overridden via:
+# - application-dev.yml
+# - application-prod.yml
+# - Environment variables
+# - Command-line arguments: --spring.profiles.active=prod
+# ============================================================================
+
+---
+# Development Profile
+spring:
+  config:
+    activate:
+      on-profile: dev
+
+  data:
+    redis:
+      host: localhost
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: http://localhost:8085
+
+logging:
+  level:
+    root: DEBUG
+    org.springframework.cloud.gateway: TRACE
+
+---
+# Production Profile
+spring:
+  config:
+    activate:
+      on-profile: prod
+
+  data:
+    redis:
+      host: redis-cluster.algoshare.internal
+      password: ${REDIS_PASSWORD}
+      ssl:
+        enabled: true
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://auth.algoshare.io
+
+logging:
+  level:
+    root: WARN
+    com.algoshare.gateway: INFO
+
+  file:
+    name: /var/log/algoshare/gateway.log

@@ -1,0 +1,28 @@
+server:
+  port: 8085
+
+spring:
+  application:
+    name: ALGOSHARE-AUTH
+  
+  datasource:
+    url: jdbc:postgresql://localhost:5432/algoshare_auth
+    username: postgres
+    password: password
+  
+  jpa:
+    hibernate:
+      ddl-auto: update
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+# Logging
+logging:
+  level:
+    root: INFO
+    com.algoshare.auth: DEBUG
+
+algoshare:
+  auth:
+    issuer-uri: ${AUTH_ISSUER_URI:http://localhost:8085}

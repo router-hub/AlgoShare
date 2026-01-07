@@ -1,4 +1,4 @@
-package com.algoshare.algoshare_user_payment;
+package com.algoshare.userpayment;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;

@@ -1,13 +1,13 @@
-package com.algoshare.algoshare_ai;
+package com.algoshare.strategy;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 @SpringBootApplication
-public class AlgoshareAiApplication {
+public class AlgoshareStrategyApplication {
 
 	public static void main(String[] args) {
-		SpringApplication.run(AlgoshareAiApplication.class, args);
+		SpringApplication.run(AlgoshareStrategyApplication.class, args);
 	}
 
 }

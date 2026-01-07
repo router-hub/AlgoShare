@@ -1,4 +1,4 @@
-package com.algoshare.algoshare_order;
+package com.algoshare.order;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;

@@ -1,13 +1,94 @@
-plugin {
-    id 'org.springframework.boot' version '3.2.3' apply false
-    id 'io.spring.dependency-management' version '1.1.4' apply false
+plugins {
+    // -------------------------------------------------------------
+    // 1. Spring Boot Plugin (id: 'org.springframework.boot')
+    // Role: The heart of a Spring Boot project. It provides:
+    //  - Dependency Management: Manages versions of 3rd party libs so they play nice together.
+    //  - Executable Jar: Adds the 'bootJar' task to package the app with all dependencies.
+    //  - Auto-Configuration: The magic that scans your classpath and configures beans automatically.
+    // Interview QA: "Difference between a regular JAR and a Spring Boot JAR?" -> A Boot JAR allows nested dependencies (jars inside jars) and has a custom classloader to run them.
+    // -------------------------------------------------------------
+    id 'org.springframework.boot' version '3.5.9' apply false
+
+    // -------------------------------------------------------------
+    // 2. Dependency Management Plugin (id: 'io.spring.dependency-management')
+    // Role: Allows us to use a BOM (Bill of Materials) without extending a parent POM.
+    // Why here? Even though the Boot plugin handles dependencies, this plugin allows more granular control
+    // like importing Spring Cloud dependencies which are not part of the standard Boot starter parent.
+    // -------------------------------------------------------------
+    id 'io.spring.dependency-management' version '1.1.7' apply false
+
+    id 'jacoco'
+    id 'com.diffplug.spotless' version '6.21.0'
     id 'java'
 }
-
-allProjects {
+allprojects {
     group = "com.algoshare"
     version = "0.0.1-SNAPSHOT"
     repositories {
         mavenCentral()
+    }
+    java {
+        toolchain {
+            languageVersion.set(JavaLanguageVersion.of(21))
+        }
+    }
+}
+
+// -------------------------------------------------------------
+// 'subprojects' vs 'allprojects'
+// - subprojects: Configuration applied ONLY to the child modules (gateway, auth, etc.), excluding the root.
+// - allprojects: Applied to root + all children.
+// Use 'subprojects' for plugins/dependencies because the root folder (this one) usually doesn't have source code to compile.
+// -------------------------------------------------------------
+subprojects {
+    apply plugin: 'java'
+    apply plugin: 'org.springframework.boot'
+    apply plugin: 'io.spring.dependency-management'
+    apply plugin: 'jacoco'
+    apply plugin: 'com.diffplug.spotless'
+
+    ext {
+        set('springCloudVersion', "2025.0.1")
+    }
+
+    dependencyManagement {
+        imports {
+            // Spring Cloud BOM: Ensures all microservice patterns (Gateway, Consule, CircuitBreaker) use compatible versions.
+            mavenBom "org.springframework.cloud:spring-cloud-dependencies:${springCloudVersion}"
+        }
+    }
+    dependencies {
+        // NFR-1 & NFR-5: Observability & Auditability
+        // Exposes /actuator/health, /info, /metrics endpoints. Critical for K8s Liveness/Readiness probes.
+        implementation 'org.springframework.boot:spring-boot-starter-actuator'
+        implementation 'org.springframework.boot:spring-boot-starter-log4j2'
+        
+        // Boilerplate reduction: @Getter, @Setter, @Builder, @Slf4j
+        compileOnly 'org.projectlombok:lombok'
+        annotationProcessor 'org.projectlombok:lombok'
+        
+        // Testing: JUnit 5, Mockito, AssertJ
+        testImplementation 'org.springframework.boot:spring-boot-starter-test'
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    }
+
+    configurations {
+        all {
+            exclude group: 'org.springframework.boot', module: 'spring-boot-starter-logging'
+        }
+    }
+    
+    jacoco {
+        toolVersion = "0.8.8"
+    }
+    
+    spotless {
+        java {
+            googleJavaFormat()
+        }
+    }
+
+    tasks.named('test') {
+        useJUnitPlatform()
     }
 }

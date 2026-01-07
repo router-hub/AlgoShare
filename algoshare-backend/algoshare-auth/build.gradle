@@ -1,0 +1,12 @@
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    runtimeOnly 'org.postgresql:postgresql'
+    
+    // JWT Libraries (commonly used for manual RS256 signing if not using full Auth Server)
+    implementation 'com.nimbusds:nimbus-jose-jwt:9.37.3'
+    // implementation 'io.jsonwebtoken:jjwt-api:0.12.5'
+    // runtimeOnly 'io.jsonwebtoken:jjwt-impl:0.12.5'
+    // runtimeOnly 'io.jsonwebtoken:jjwt-jackson:0.12.5'
+}
