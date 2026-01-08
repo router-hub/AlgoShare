@@ -4,7 +4,7 @@
 # Architecture: Central entry point for all external traffic
 # Security: JWT validation via OAuth2 Resource Server
 # Resilience: Circuit Breakers + Rate Limiting + Fallbacks
-# Author: AlgoShare Team
+# Author: Aditya
 # Last Updated: January 8, 2026
 # ============================================================================
 
@@ -112,17 +112,105 @@ spring:
       # ----------------------------------------------------------------------
       default-filters:
         - DedupeResponseHeader=Access-Control-Allow-Origin Access-Control-Allow-Credentials, RETAIN_UNIQUE
-        - name: Retry
-          args:
-            retries: 3
-            statuses: BAD_GATEWAY,SERVICE_UNAVAILABLE
-            methods: GET,POST
-            backoff:
-              firstBackoff: 50ms
-              maxBackoff: 500ms
-              factor: 2
-              basedOnPreviousValue: false
+        # Retry moved to route-specific filters for proper ordering with Circuit Breaker
 
+      # ----------------------------------------------------------------------
+      # FILTER EXECUTION ORDER (Request → Response Flow)
+      # ----------------------------------------------------------------------
+      # Understanding how filters execute is CRITICAL for debugging and interviews!
+      #
+      # FORWARD PATH (Client → Downstream Service):
+      # ═══════════════════════════════════════════════════════════════════════
+      # 1️⃣ Client sends request → Gateway
+      #
+      # 2️⃣ Spring Security (Global Filter - HIGHEST_PRECEDENCE)
+      #     - Validate JWT signature using JWK Set from Auth Service
+      #     - Extract principal (user identity)
+      #     - Set ReactiveSecurityContext
+      #     - Reject if invalid ❌ (return 401 Unauthorized)
+      #
+      # 3️⃣ UserContextFilter (Global Filter - LOWEST_PRECEDENCE - 10)
+      #     - Read JWT from ReactiveSecurityContext
+      #     - Extract claims: userId (sub), issuer (iss)
+      #     - Add headers for downstream services:
+      #         → X-User-Id: {userId}
+      #         → X-Token-Issuer: {issuer}
+      #
+      # 4️⃣ DedupeResponseHeader (Default Filter)
+      #     - No action on request (processes response only)
+      #
+      # 5️⃣ AlgoShareRateLimit (Route-Specific Filter #1)
+      #     - Check Redis token bucket: capacity, refillRate
+      #     - Example: User has 150/200 tokens ✅
+      #     - Consume 1 token → 149/200 remaining
+      #     - If quota exceeded → Reject with 429 Too Many Requests ❌
+      #
+      # 6️⃣ AlgoShareBulkhead (Route-Specific Filter #2)
+      #     - Check concurrent request slots
+      #     - Example: 45/100 slots used ✅
+      #     - Acquire slot → 46/100
+      #     - If full → Queue (if enabled) or Reject with 429 ❌
+      #
+      # 7️⃣ AlgoShareTimeout (Route-Specific Filter #3)
+      #     - Start Reactor timeout timer (e.g., 3 seconds for order service)
+      #     - Schedule timeout task on event loop
+      #     - If timeout fires → Cancel downstream, return 504 Gateway Timeout ❌
+      #
+      # 8️⃣ AlgoShareRetry (Route-Specific Filter #4)
+      #     - Wrap downstream call with retry logic
+      #     - Setup retry context (no retry yet on first attempt)
+      #     - On failure → Check if retriable → Sleep (backoff) → Retry
+      #     - On CircuitOpenException → STOP retrying ❌
+      #
+      # 9️⃣ AlgoShareCircuitBreaker (Route-Specific Filter #5) [FINAL GUARDIAN]
+      #     - Check circuit state:
+      #         CLOSED ✅ → Allow request, track start time
+      #         OPEN ❌ → Reject immediately (503), no downstream call
+      #         HALF_OPEN ⚠️ → Allow limited probe requests
+      #     - Record request in sliding window
+      #     - Why LAST? → Observes final outcome after ALL retries
+      #
+      # 🔟 ReactiveLoadBalancerClientFilter (Global Built-in - Order: -10150)
+      #     - Resolve service name (e.g., algoshare-order)
+      #     - Query Eureka/Consul for available instances
+      #     - Select instance using load balancing (Round Robin, Random, etc.)
+      #     - Example: 192.168.1.10:8083
+      #
+      # 1️⃣1️⃣ NettyRoutingFilter (Global Built-in - LOWEST_PRECEDENCE)
+      #     - Make actual HTTP call using Netty WebClient
+      #     - Service responds: 200 OK in 150ms (example)
+      #
+      # ═══════════════════════════════════════════════════════════════════════
+      # RETURN PATH (Downstream Service → Client):
+      # ═══════════════════════════════════════════════════════════════════════
+      # Filters execute in REVERSE order on the response!
+      #
+      # 1️⃣1️⃣ NettyRoutingFilter: Receives HTTP response from service
+      # 🔟 LoadBalancerClientFilter: No action on response
+      # 9️⃣ CircuitBreaker: Record SUCCESS/FAILURE, update metrics
+      # 8️⃣ Retry: Success on first attempt (no retry needed)
+      # 7️⃣ Timeout: Cancel timeout task (request completed in 150ms)
+      # 6️⃣ Bulkhead: Release slot → 45/100 (back to original)
+      # 5️⃣ RateLimit: No action on response
+      # 4️⃣ DedupeResponseHeader: Remove duplicate CORS headers
+      # 3️⃣ UserContextFilter: No action on response
+      # 2️⃣ Spring Security: No action on response
+      # 1️⃣ Client receives response: 200 OK
+      #
+      # ═══════════════════════════════════════════════════════════════════════
+      # KEY PRINCIPLES (Interview Gold!):
+      # ═══════════════════════════════════════════════════════════════════════
+      # ✅ Global filters run on EVERY request (Security, UserContext, etc.)
+      # ✅ Default filters run on ALL routes (DedupeResponseHeader)
+      # ✅ Route filters run only for matched routes (Rate Limit, etc.)
+      # ✅ Filters execute in ORDER on request, REVERSE on response
+      # ✅ RateLimit FIRST → Fail fast, save resources
+      # ✅ CircuitBreaker LAST → Observe final outcomes after retries
+      # ✅ Retry wraps CB → Each retry checks circuit state
+      # ✅ Timeout before Retry → Retry can handle timeout exceptions
+      # ✅ Circuit states: CLOSED = Allow ✅, OPEN = Reject ❌
+      # ═══════════════════════════════════════════════════════════════════════
+      
       # ----------------------------------------------------------------------
       # Route Definitions
       # ----------------------------------------------------------------------
@@ -162,7 +250,11 @@ spring:
           predicates:
             - Path=/api/user-payment/**
           filters:
-            - name: RedisRateLimit
+            # Filter Order: RateLimit → Bulkhead → Timeout → Retry → CircuitBreaker
+            # Ensures: Circuit Breaker observes final outcomes after retries
+            
+            # 1️⃣ Rate Limiting (Block abuse early)
+            - name: AlgoShareRateLimit
               args:
                 name: payment-limiter
                 capacity: 100
@@ -171,6 +263,33 @@ spring:
                 ttl: 120
                 failOpen: false               # CRITICAL: Don't allow on Redis failure
 
+            # 2️⃣ Bulkhead (Limit concurrency)
+            - name: AlgoShareBulkhead
+              args:
+                name: payment-bulkhead
+                maxConcurrent: 50
+                queueCapacity: 10
+                queueTimeoutMs: 2000
+
+            # 3️⃣ Timeout (Fail fast on slowness)
+            - name: AlgoShareTimeout
+              args:
+                serviceName: payment-service
+                timeoutMs: 5000
+
+            # 4️⃣ Retry (Recover from transient failures)
+            - name: AlgoShareRetry
+              args:
+                name: payment-retry
+                retries: 3
+                statuses: SERVICE_UNAVAILABLE,GATEWAY_TIMEOUT
+                methods: GET,POST
+                backoff:
+                  firstBackoff: 100ms
+                  maxBackoff: 1000ms
+                  factor: 2
+
+            # 5️⃣ Circuit Breaker (Final guardian - observes final outcomes)
             - name: AlgoShareCircuitBreaker
               args:
                 name: payment-cb
@@ -181,8 +300,6 @@ spring:
                 slidingWindowSize: 20
                 halfOpenPermits: 3
                 fallbackUri: forward:/fallback/payment
-          metadata:
-            response-timeout: 5000
 
         # ====================================================================
         # Route 3: Order Execution Service (CRITICAL - Trading Operations)
@@ -199,7 +316,10 @@ spring:
           predicates:
             - Path=/api/order/**
           filters:
-            - name: RedisRateLimit
+            # Filter Order: RateLimit → Bulkhead → Timeout → Retry → CircuitBreaker
+            
+            # 1️⃣ Rate Limiting
+            - name: AlgoShareRateLimit
               args:
                 name: order-limiter
                 capacity: 200
@@ -208,6 +328,33 @@ spring:
                 ttl: 120
                 failOpen: false               # CRITICAL: Trading operations
 
+            # 2️⃣ Bulkhead
+            - name: AlgoShareBulkhead
+              args:
+                name: order-bulkhead
+                maxConcurrent: 100
+                queueCapacity: 20
+                queueTimeoutMs: 1000
+
+            # 3️⃣ Timeout (Strict - NFR-2 requirement)
+            - name: AlgoShareTimeout
+              args:
+                serviceName: order-service
+                timeoutMs: 3000
+
+            # 4️⃣ Retry (Limited for trading operations)
+            - name: AlgoShareRetry
+              args:
+                name: order-retry
+                retries: 2                    # Fewer retries for trading
+                statuses: SERVICE_UNAVAILABLE
+                methods: GET                  # Only retry safe operations
+                backoff:
+                  firstBackoff: 50ms
+                  maxBackoff: 500ms
+                  factor: 2
+
+            # 5️⃣ Circuit Breaker (Very strict)
             - name: AlgoShareCircuitBreaker
               args:
                 name: order-cb
@@ -218,9 +365,6 @@ spring:
                 slidingWindowSize: 20
                 halfOpenPermits: 2
                 fallbackUri: forward:/fallback/order
-          metadata:
-            response-timeout: 3000
-            connect-timeout: 1000
 
         # ====================================================================
         # Route 4: AI Financial Assistant (EXPENSIVE - LLM API)
@@ -237,8 +381,10 @@ spring:
           predicates:
             - Path=/api/ai/chat/**,/api/ai/summary/**
           filters:
-            # FR-6.4: AI Chat limited to 10/minute
-            - name: RedisRateLimit
+            # Filter Order: RateLimit → Bulkhead → Timeout → Retry → CircuitBreaker
+            
+            # 1️⃣ Rate Limiting (FR-6.4: AI Chat limited to 10/minute)
+            - name: AlgoShareRateLimit
               args:
                 name: ai-chat-limiter
                 capacity: 10
@@ -247,6 +393,33 @@ spring:
                 ttl: 120
                 failOpen: true                # Allow on Redis failure (not critical)
 
+            # 2️⃣ Bulkhead (Limit concurrent LLM calls)
+            - name: AlgoShareBulkhead
+              args:
+                name: ai-chat-bulkhead
+                maxConcurrent: 10
+                queueCapacity: 5
+                queueTimeoutMs: 5000
+
+            # 3️⃣ Timeout (LLM can be slow)
+            - name: AlgoShareTimeout
+              args:
+                serviceName: ai-chat-service
+                timeoutMs: 10000              # 10 seconds for LLM
+
+            # 4️⃣ Retry (Don't retry LLM calls - expensive)
+            - name: AlgoShareRetry
+              args:
+                name: ai-chat-retry
+                retries: 1                    # Minimal retry for expensive LLM calls
+                statuses: SERVICE_UNAVAILABLE
+                methods: GET
+                backoff:
+                  firstBackoff: 1000ms
+                  maxBackoff: 2000ms
+                  factor: 2
+
+            # 5️⃣ Circuit Breaker (Relaxed - external API)
             - name: AlgoShareCircuitBreaker
               args:
                 name: ai-chat-cb
@@ -257,8 +430,6 @@ spring:
                 slidingWindowSize: 20
                 halfOpenPermits: 3
                 fallbackUri: forward:/fallback/ai
-          metadata:
-            response-timeout: 10000           # 10 seconds for LLM
 
         # AI Training Endpoint (Very Expensive - Different Rate Limit)
         - id: ai-service-training
@@ -266,8 +437,10 @@ spring:
           predicates:
             - Path=/api/ai/train/**
           filters:
-            # Much stricter: 5 requests per minute, each costs 5 tokens
-            - name: RedisRateLimit
+            # Filter Order: RateLimit → Bulkhead → Timeout → Retry → CircuitBreaker
+            
+            # 1️⃣ Rate Limiting (VERY strict - expensive LLM training)
+            - name: AlgoShareRateLimit
               args:
                 name: ai-training-limiter
                 capacity: 5
@@ -276,6 +449,33 @@ spring:
                 ttl: 300                      # 5 minutes TTL
                 failOpen: false               # Don't allow on errors (very expensive)
 
+            # 2️⃣ Bulkhead (Severely limit concurrent training)
+            - name: AlgoShareBulkhead
+              args:
+                name: ai-training-bulkhead
+                maxConcurrent: 3
+                queueCapacity: 2
+                queueTimeoutMs: 10000
+
+            # 3️⃣ Timeout (Long timeout for training)
+            - name: AlgoShareTimeout
+              args:
+                serviceName: ai-training-service
+                timeoutMs: 30000              # 30 seconds for training
+
+            # 4️⃣ Retry (NO retry for expensive training)
+            - name: AlgoShareRetry
+              args:
+                name: ai-training-retry
+                retries: 0                    # No retry - too expensive!
+                statuses: SERVICE_UNAVAILABLE
+                methods: POST
+                backoff:
+                  firstBackoff: 1000ms
+                  maxBackoff: 2000ms
+                  factor: 2
+
+            # 5️⃣ Circuit Breaker
             - name: AlgoShareCircuitBreaker
               args:
                 name: ai-training-cb
@@ -285,8 +485,6 @@ spring:
                 successThreshold: 2
                 halfOpenPermits: 2
                 fallbackUri: forward:/fallback/ai
-          metadata:
-            response-timeout: 30000           # 30 seconds for training
 
         # ====================================================================
         # Route 5: Strategy Service (HIGH FREQUENCY - Tick Processing)
@@ -303,7 +501,10 @@ spring:
           predicates:
             - Path=/api/strategy/**
           filters:
-            - name: RedisRateLimit
+            # Filter Order: RateLimit → Bulkhead → Timeout → Retry → CircuitBreaker
+            
+            # 1️⃣ Rate Limiting (Very high - continuous tick processing)
+            - name: AlgoShareRateLimit
               args:
                 name: strategy-limiter
                 capacity: 1000
@@ -312,6 +513,33 @@ spring:
                 ttl: 120
                 failOpen: true                # Don't block on Redis failure
 
+            # 2️⃣ Bulkhead (High concurrency for high frequency)
+            - name: AlgoShareBulkhead
+              args:
+                name: strategy-bulkhead
+                maxConcurrent: 200
+                queueCapacity: 50
+                queueTimeoutMs: 500
+
+            # 3️⃣ Timeout (Must be fast for NFR-2)
+            - name: AlgoShareTimeout
+              args:
+                serviceName: strategy-service
+                timeoutMs: 2000
+
+            # 4️⃣ Retry (Quick retries for high frequency)
+            - name: AlgoShareRetry
+              args:
+                name: strategy-retry
+                retries: 2
+                statuses: SERVICE_UNAVAILABLE
+                methods: GET,POST
+                backoff:
+                  firstBackoff: 20ms
+                  maxBackoff: 100ms
+                  factor: 2
+
+            # 5️⃣ Circuit Breaker (Moderate - high tolerance)
             - name: AlgoShareCircuitBreaker
               args:
                 name: strategy-cb
@@ -322,8 +550,6 @@ spring:
                 slidingWindowSize: 50
                 halfOpenPermits: 5
                 fallbackUri: forward:/fallback/strategy
-          metadata:
-            response-timeout: 2000
 
         # ====================================================================
         # Route 6A: Market Data Ingestion (INTERNAL - Not Exposed)
@@ -361,8 +587,11 @@ spring:
           predicates:
             - Path=/api/market/price/**,/api/market/prices/**
           filters:
+            # Filter Order: RateLimit → Bulkhead → Timeout → Retry → CircuitBreaker
             # IP-based rate limiting (public endpoint)
-            - name: RedisRateLimit
+            
+            # 1️⃣ Rate Limiting
+            - name: AlgoShareRateLimit
               args:
                 name: market-data-limiter
                 capacity: 1000                # High throughput for dashboards
@@ -371,6 +600,33 @@ spring:
                 ttl: 60
                 failOpen: true                # Non-critical, fail open
 
+            # 2️⃣ Bulkhead
+            - name: AlgoShareBulkhead
+              args:
+                name: market-data-bulkhead
+                maxConcurrent: 200
+                queueCapacity: 50
+                queueTimeoutMs: 1000
+
+            # 3️⃣ Timeout
+            - name: AlgoShareTimeout
+              args:
+                serviceName: market-data-service
+                timeoutMs: 2000
+
+            # 4️⃣ Retry
+            - name: AlgoShareRetry
+              args:
+                name: market-data-retry
+                retries: 2
+                statuses: SERVICE_UNAVAILABLE
+                methods: GET
+                backoff:
+                  firstBackoff: 50ms
+                  maxBackoff: 500ms
+                  factor: 2
+
+            # 5️⃣ Circuit Breaker
             - name: AlgoShareCircuitBreaker
               args:
                 name: market-data-cb
@@ -379,8 +635,6 @@ spring:
                 slowCallThreshold: 100
                 successThreshold: 3
                 halfOpenPermits: 5
-          metadata:
-            response-timeout: 2000
 
         # ====================================================================
         # Route 6C: Market Data WebSocket (REAL-TIME STREAMING)

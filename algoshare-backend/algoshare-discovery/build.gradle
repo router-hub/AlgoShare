@@ -1,4 +1,6 @@
-dependencies {
-	implementation 'org.springframework.cloud:spring-cloud-starter-netflix-eureka-server'
-}
+// This module inherits plugins from root build.gradle subprojects block
+// (Spring Boot, Dependency Management, Java, etc.)
 
+dependencies {
+    implementation 'org.springframework.cloud:spring-cloud-starter-netflix-eureka-server'
+}
