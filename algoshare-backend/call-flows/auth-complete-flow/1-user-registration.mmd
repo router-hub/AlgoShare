@@ -1,0 +1,31 @@
+graph TB
+    A1[User submits registration form] --> A2[Gateway: AlgoShareRateLimitFilterFactory]
+    A2 --> A3{Rate limit check<br/>Redis: ratelimit:register:ip}
+    A3 -->|Exceeded 20/hour| A4[429 Too Many Requests]
+    A3 -->|Allowed| A5[POST /auth/register<br/>Auth Service MVC]
+
+    A5 --> A6[Validate input<br/>email regex, password strength]
+    A6 --> A7[Check email exists<br/>SELECT FROM users WHERE email]
+    A7 -->|Exists| A8[400 Email already registered]
+    A7 -->|New| A9[Hash password<br/>BCrypt cost=12]
+
+    A9 --> A10[Generate userId<br/>UUID v4]
+    A10 --> A11[INSERT INTO users<br/>status=PENDING_VERIFICATION]
+    A11 --> A12[Generate random token - 256-bit</br> Store hash token in DB</br>Send raw token in email]
+    A12 --> A13[INSERT INTO email_verification_tokens<br/>token_hash, user_id, expires_at]
+
+    A13 --> A14[Publish Kafka Event<br/>Topic: user.events<br/>Event: USER_REGISTERED]
+    A14 --> A15[202 Accepted<br/>message: Check your email]
+
+    A14 -.Async.-> A16[Notification Service<br/>Kafka Consumer]
+    A16 --> A17[token transferred]
+    A17 --> A18[Build verification URL<br/>https://app.algoshare.com/verify?token]
+    A18 --> A19[Load email template<br/>Thymeleaf: registration.html]
+    A19 --> A20[Publish to RabbitMQ<br/>Queue: email.outbound]
+
+    A20 -.Async.-> A21[Email Worker]
+    A21 --> A22[Send via AWS SES<br/>Retry: 3 attempts]
+    A22 -->|Success| A23[INSERT INTO email_delivery_log<br/>status=DELIVERED]
+    A22 -->|Failed| A24[Publish to DLQ<br/>+ Alert Ops]
+
+    style A1 fill:#e1f5ff

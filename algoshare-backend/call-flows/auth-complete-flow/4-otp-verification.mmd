@@ -1,0 +1,40 @@
+graph TB
+    D1[User submits OTP+partialJwt] --> D2[Gateway: Rate limit<br/>otp-verify:sessionId 10/5min]
+    D2 --> D3[POST /auth/otp/verify<br/>partialJwt, otp, sessionId]
+    D3 --> D4[Verify JWT signature<br/>RS256 with public key from JWKS]
+    D4 -->|Invalid| D5[401 Invalid token]
+    D4 -->|Valid| D6[Validate JWT claims<br/>exp, iss=algoshare-auth<br/>aud=algoshare-gateway<br/>token_type=PRE_AUTH<br/>mfa=false]
+
+    D6 -->|Expired/Invalid| D7[401 Token expired or invalid claims]
+    D6 -->|Valid| D7A[Calculate current fingerprint<br/>ipHash = SHA256 request.ip<br/>uaHash = SHA256 request.User-Agent]
+    D7A --> D8[Redis GET session:sessionId]
+    D8 -->|Not found| D9[401 Session expired]
+    D8 -->|Found| D8A{Verify device fingerprint<br/>ipHash == session.ipHash<br/>uaHash == session.uaHash}
+    
+    D8A -->|Mismatch| D8B[401 Device mismatch<br/>Possible token replay attack]
+    D8A -->|Match| D10[Redis GET otp:sessionId]
+    D10 -->|Not found| D11[401 OTP expired/used]
+    D10 -->|Found| D12[Decrypt stored OTP<br/>AES-256-GCM]
+    D12 --> D13{Compare OTP}
+    D13 -->|Mismatch| D14[Increment attempts<br/>Redis INCR attempts:sessionId]
+    D14 --> D15{attempts >= 3}
+    D15 -->|Yes| D16[Lock session<br/>Redis DEL otp:sessionId<br/>401 Max attempts exceeded]
+    D15 -->|No| D17[401 Invalid OTP<br/>attempts remaining: X]
+
+    D13 -->|Match| D18[BEGIN TRANSACTION]
+    D18 --> D19[SELECT roles, permissions<br/>FROM user_roles JOIN roles<br/>WHERE user_id=userId]
+    D19 --> D20[UPDATE users<br/>SET last_login=NOW<br/>WHERE id=userId]
+    D20 --> D21[INSERT INTO login_audit_log<br/>user_id, ip, sessionId, timestamp]
+    D21 --> D22[COMMIT]
+
+    D22 --> D23[Generate FULL JWT - ACCESS token<br/>RS256 signed]
+    D23 --> D24[JWT Claims:<br/>sub=userId<br/>email=email<br/>aud=algoshare-gateway<br/>token_type=ACCESS<br/>mfa=true<br/>roles=ROLE_USER<br/>permissions=trade:execute<br/>exp=now+7days<br/>iss=algoshare-auth<br/>jti=unique-token-id]
+
+    D24 --> D25[Redis DEL otp:sessionId]
+    D25 --> D26[Redis DEL session:sessionId]
+    D26 --> D27[Redis DEL attempts:sessionId]
+    D27 --> D27A[Redis DEL otp_resend:sessionId]
+    D27A --> D28[Redis SET token:jti<br/>userId, issuedAt, tokenType=ACCESS<br/>TTL=7days]
+    D28 --> D29[200 OK<br/>token: full-jwt<br/>expiresIn: 604800<br/>tokenType: ACCESS]
+
+    style D1 fill:#f3e5f5

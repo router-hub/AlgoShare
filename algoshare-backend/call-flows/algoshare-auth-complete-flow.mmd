@@ -1,0 +1,143 @@
+
+graph TB
+    subgraph "1️⃣ USER REGISTRATION FLOW"
+        A1[User submits registration form] --> A2[Gateway: AlgoShareRateLimitFilterFactory]
+        A2 --> A3{Rate limit check<br/>Redis: ratelimit:register:ip}
+        A3 -->|Exceeded 20/hour| A4[429 Too Many Requests]
+        A3 -->|Allowed| A5[POST /auth/register<br/>Auth Service MVC]
+
+        A5 --> A6[Validate input<br/>email regex, password strength]
+        A6 --> A7[Check email exists<br/>SELECT FROM users WHERE email]
+        A7 -->|Exists| A8[400 Email already registered]
+        A7 -->|New| A9[Hash password<br/>BCrypt cost=12]
+
+        A9 --> A10[Generate userId<br/>UUID v4]
+        A10 --> A11[INSERT INTO users<br/>status=PENDING_VERIFICATION]
+        A11 --> A12[Generate verification token<br/>AES-256-GCM encrypt userId+timestamp]
+        A12 --> A13[INSERT INTO email_verification_tokens<br/>encrypted_token, user_id, expires_at]
+
+        A13 --> A14[Publish Kafka Event<br/>Topic: user.events<br/>Event: USER_REGISTERED]
+        A14 --> A15[202 Accepted<br/>message: Check your email]
+
+        A14 -.Async.-> A16[Notification Service<br/>Kafka Consumer]
+        A16 --> A17[Decrypt token<br/>AES-256-GCM]
+        A17 --> A18[Build verification URL<br/>https://app.algoshare.com/verify?token=encrypted]
+        A18 --> A19[Load email template<br/>Thymeleaf: registration.html]
+        A19 --> A20[Publish to RabbitMQ<br/>Queue: email.outbound]
+
+        A20 -.Async.-> A21[Email Worker]
+        A21 --> A22[Send via AWS SES<br/>Retry: 3 attempts]
+        A22 -->|Success| A23[INSERT INTO email_delivery_log<br/>status=DELIVERED]
+        A22 -->|Failed| A24[Publish to DLQ<br/>+ Alert Ops]
+    end
+
+    subgraph "2️⃣ EMAIL VERIFICATION FLOW"
+        B1[User clicks email link] --> B2[Gateway: Rate limit<br/>verify:ip 100/hour]
+        B2 --> B3[GET /auth/verify-email?token=encrypted]
+        B3 --> B4[Decrypt token<br/>AES-256-GCM]
+        B4 -->|Invalid/Expired| B5[400 Invalid token]
+        B4 -->|Valid| B6[SELECT FROM email_verification_tokens<br/>WHERE encrypted_token AND expires_at > NOW]
+
+        B6 -->|Not found| B7[400 Token expired/used]
+        B6 -->|Found| B8[BEGIN TRANSACTION]
+        B8 --> B9[UPDATE users<br/>SET status=EMAIL_VERIFIED, verified_at=NOW<br/>WHERE id=user_id]
+        B9 --> B10[DELETE FROM email_verification_tokens<br/>WHERE user_id=user_id]
+        B10 --> B11[COMMIT]
+        B11 --> B12[Redirect to login page<br/>302 /login?verified=true]
+    end
+
+    subgraph "3️⃣ LOGIN FLOW - STEP 1 PASSWORD"
+        C1[User submits email+password] --> C2[Gateway: Rate limit<br/>login:ip 60/10min]
+        C2 --> C3[POST /auth/login]
+        C3 --> C4[SELECT FROM users<br/>WHERE email=?]
+        C4 -->|Not found| C5[401 Invalid credentials]
+        C4 -->|Found| C6[Verify password<br/>BCrypt.checkpw]
+
+        C6 -->|Mismatch| C7[401 Invalid credentials<br/>+ Log failed attempt]
+        C6 -->|Match| C8{Check email verified}
+        C8 -->|status != EMAIL_VERIFIED| C9[403 Email not verified]
+        C8 -->|Verified| C10[Generate login session<br/>sessionId = UUID v4]
+
+        C10 --> C11[Store session metadata<br/>Redis: session:sessionId<br/>userId, email, createdAt<br/>TTL=5min]
+        C11 --> C12[Generate PARTIAL JWT<br/>RS256 signed]
+        C12 --> C13[JWT Claims:<br/>sub=userId<br/>email=email<br/>mfa=false<br/>sessionId=sessionId<br/>exp=now+5min<br/>iss=algoshare-auth]
+
+        C13 --> C14[Publish Kafka Event<br/>Topic: auth.events<br/>Event: LOGIN_OTP_REQUESTED]
+        C14 --> C15[200 OK<br/>status: OTP_REQUIRED<br/>partialJwt: eyJhbGc...<br/>sessionId: xyz789]
+
+        C14 -.Async.-> C16[Notification Service<br/>Kafka Consumer]
+        C16 --> C17[Generate OTP<br/>6-digit random: 123456]
+        C17 --> C18[Encrypt OTP<br/>AES-256-GCM with session key]
+        C18 --> C19[Store in Redis<br/>Key: otp:sessionId<br/>Value: encrypted_otp<br/>TTL=5min]
+        C19 --> C20[Load email template<br/>Thymeleaf: login-otp.html]
+        C20 --> C21[Publish to RabbitMQ<br/>Queue: email.outbound]
+
+        C21 -.Async.-> C22[Email Worker]
+        C22 --> C23[Send OTP email via SES]
+        C23 --> C24[INSERT INTO email_delivery_log]
+    end
+
+    subgraph "4️⃣ LOGIN FLOW - STEP 2 OTP VERIFICATION"
+        D1[User submits OTP+partialJwt] --> D2[Gateway: Rate limit<br/>otp-verify:sessionId 10/5min]
+        D2 --> D3[POST /auth/otp/verify<br/>partialJwt, otp, sessionId]
+        D3 --> D4[Verify JWT signature<br/>RS256 with public key from JWKS]
+        D4 -->|Invalid| D5[401 Invalid token]
+        D4 -->|Valid| D6[Validate JWT claims<br/>exp, iss, mfa=false]
+
+        D6 -->|Expired/Invalid| D7[401 Token expired]
+        D6 -->|Valid| D8[Redis GET session:sessionId]
+        D8 -->|Not found| D9[401 Session expired]
+        D8 -->|Found| D10[Redis GET otp:sessionId]
+
+        D10 -->|Not found| D11[401 OTP expired/used]
+        D10 -->|Found| D12[Decrypt stored OTP<br/>AES-256-GCM]
+        D12 --> D13{Compare OTP}
+        D13 -->|Mismatch| D14[Increment attempts<br/>Redis INCR attempts:sessionId]
+        D14 --> D15{attempts >= 3}
+        D15 -->|Yes| D16[Lock session<br/>Redis DEL otp:sessionId<br/>401 Max attempts exceeded]
+        D15 -->|No| D17[401 Invalid OTP<br/>attempts remaining: X]
+
+        D13 -->|Match| D18[BEGIN TRANSACTION]
+        D18 --> D19[SELECT roles, permissions<br/>FROM user_roles JOIN roles<br/>WHERE user_id=userId]
+        D19 --> D20[UPDATE users<br/>SET last_login=NOW<br/>WHERE id=userId]
+        D20 --> D21[INSERT INTO login_audit_log<br/>user_id, ip, sessionId, timestamp]
+        D21 --> D22[COMMIT]
+
+        D22 --> D23[Generate FULL JWT<br/>RS256 signed]
+        D23 --> D24[JWT Claims:<br/>sub=userId<br/>email=email<br/>mfa=true<br/>roles=ROLE_USER<br/>permissions=trade:execute<br/>exp=now+7days<br/>iss=algoshare-auth<br/>jti=unique-token-id]
+
+        D24 --> D25[Redis DEL otp:sessionId]
+        D25 --> D26[Redis DEL session:sessionId]
+        D26 --> D27[Redis DEL attempts:sessionId]
+        D27 --> D28[Redis SET token:jti<br/>userId, issuedAt<br/>TTL=7days]
+        D28 --> D29[200 OK<br/>token: full-jwt<br/>expiresIn: 604800]
+    end
+
+    subgraph "5️⃣ ENCRYPTED TOKEN MANAGEMENT"
+        E1[Token Encryption Layer] --> E2[AES-256-GCM]
+        E2 --> E3[Master key from AWS KMS]
+        E3 --> E4[Rotate every 90 days]
+
+        E5[Verification Token] --> E6[Payload: userId+timestamp+nonce]
+        E6 --> E7[Encrypt → Base64URL → Store]
+
+        E8[OTP Storage] --> E9[Plain OTP: 123456]
+        E9 --> E10[Encrypt with session key]
+        E10 --> E11[Store in Redis]
+    end
+
+    subgraph "6️⃣ GATEWAY RATE LIMITING REDIS KEYS"
+        F1[Redis Key Structure] --> F2[ratelimit:register:ip:192.168.1.1]
+        F1 --> F3[ratelimit:login:ip:192.168.1.1]
+        F1 --> F4[ratelimit:otp-verify:session:xyz789]
+        F1 --> F5[ratelimit:api:user:userId123]
+
+        F6[Token Bucket State] --> F7[tokens: 95]
+        F6 --> F8[lastRefill: 1736534400]
+        F6 --> F9[TTL: 3600 seconds]
+    end
+
+    style A1 fill:#e1f5ff
+    style C1 fill:#fff3e0
+    style D1 fill:#f3e5f5
+    style B1 fill:#e8f5e9

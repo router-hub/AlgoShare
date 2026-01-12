@@ -1,0 +1,15 @@
+graph TB
+    B1[User clicks email link] --> B2[Gateway: Rate limit<br/>verify:ip 100/hour]
+    B2 --> B3[GET /auth/verify-email?token=encrypted]
+    B3 --> B4[Decrypt token<br/>AES-256-GCM]
+    B4 -->|Invalid/Expired| B5[400 Invalid token]
+    B4 -->|Valid| B6[SELECT FROM email_verification_tokens<br/>WHERE encrypted_token AND expires_at > NOW]
+
+    B6 -->|Not found| B7[400 Token expired/used]
+    B6 -->|Found| B8[BEGIN TRANSACTION]
+    B8 --> B9[UPDATE users<br/>SET status=EMAIL_VERIFIED, verified_at=NOW<br/>WHERE id=user_id]
+    B9 --> B10[DELETE FROM email_verification_tokens<br/>WHERE user_id=user_id]
+    B10 --> B11[COMMIT]
+    B11 --> B12[Redirect to login page<br/>302 /login?verified=true]
+
+    style B1 fill:#e8f5e9

@@ -1,0 +1,11 @@
+graph TB
+    E1[Token Encryption Layer] --> E2[AES-256-GCM]
+    E2 --> E3[Master key from AWS KMS]
+    E3 --> E4[Rotate every 90 days]
+
+    E5[Verification Token] --> E6[Payload: userId+timestamp+nonce]
+    E6 --> E7[Encrypt → Base64URL → Store]
+
+    E8[OTP Storage] --> E9[Plain OTP: 123456]
+    E9 --> E10[Encrypt with session key]
+    E10 --> E11[Store in Redis]

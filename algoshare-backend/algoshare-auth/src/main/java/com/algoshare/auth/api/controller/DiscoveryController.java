@@ -1,4 +1,4 @@
-package com.algoshare.auth.controller;
+package com.algoshare.auth.api.controller;
 
 import com.nimbusds.jose.jwk.JWKSet;
 import org.springframework.beans.factory.annotation.Value;

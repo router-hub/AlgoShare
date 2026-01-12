@@ -12,10 +12,13 @@ spring:
   
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: none
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  flyway:
+    enabled: true
 
 # Logging
 logging:
@@ -25,4 +28,12 @@ logging:
 
 algoshare:
   auth:
-    issuer-uri: ${AUTH_ISSUER_URI:http://localhost:8085}
+    issuer-uri: http://localhost:8085
+    audience: algoshare-gateway
+    token:
+      access-ttl-seconds: 604800      # 7 days
+      refresh-ttl-seconds: 2592000    # 30 days
+      pre-auth-ttl-seconds: 300       # 5 minutes
+    rsa:
+      public-key: ${RSA_PUBLIC_KEY:}
+      private-key: ${RSA_PRIVATE_KEY:}

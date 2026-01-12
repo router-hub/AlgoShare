@@ -1,0 +1,35 @@
+graph TB
+    R1[User requests OTP resend] --> R2[Gateway: Rate limit<br/>otp-resend:sessionId 5/5min]
+    R2 --> R3[POST /auth/otp/resend<br/>partialJwt, sessionId]
+    
+    R3 --> R4[Verify JWT signature<br/>RS256 with public key from JWKS]
+    R4 -->|Invalid| R5[401 Invalid token]
+    R4 -->|Valid| R6[Validate JWT claims<br/>exp, iss=algoshare-auth<br/>aud=algoshare-gateway<br/>token_type=PRE_AUTH<br/>mfa=false]
+    
+    R6 -->|Expired/Invalid| R7[401 Token expired or invalid claims]
+    R6 -->|Valid| R8[Redis GET session:sessionId]
+    R8 -->|Not found| R9[401 Session expired]
+    R8 -->|Found| R10[Redis GET otp_resend:sessionId]
+    
+    R10 --> R11{Check resend count}
+    R11 -->|count >= 3| R12[429 Too Many Requests<br/>Max resends exceeded<br/>Please restart login]
+    
+    R11 -->|count < 3| R13[Redis INCR otp_resend:sessionId]
+    R13 --> R14{Check cooldown period}
+    R14 --> R15[Redis GET last_otp_sent:sessionId]
+    R15 --> R16{Time since last send}
+    R16 -->|< 60 seconds| R17[429 Too Many Requests<br/>Retry-After: X seconds<br/>Please wait before resending]
+    
+    R16 -->|>= 60 seconds| R18[Generate new OTP<br/>6-digit random]
+    R18 --> R19[Encrypt OTP<br/>AES-256-GCM]
+    R19 --> R20[Redis SET otp:sessionId<br/>encrypted_otp, TTL=5min]
+    R20 --> R21[Redis SET last_otp_sent:sessionId<br/>timestamp, TTL=5min]
+    R21 --> R22[Publish Kafka Event<br/>Topic: auth.events<br/>Event: OTP_RESENT]
+    
+    R22 --> R23[200 OK<br/>message: OTP resent<br/>remainingResends: 3-count]
+    
+    R22 -.Async.-> R24[Notification Service]
+    R24 --> R25[Send OTP email via SES]
+    R25 --> R26[Log delivery]
+
+    style R1 fill:#e3f2fd

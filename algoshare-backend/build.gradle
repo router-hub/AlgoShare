@@ -62,6 +62,8 @@ subprojects {
         // Exposes /actuator/health, /info, /metrics endpoints. Critical for K8s Liveness/Readiness probes.
         implementation 'org.springframework.boot:spring-boot-starter-actuator'
         implementation 'org.springframework.boot:spring-boot-starter-log4j2'
+        implementation("io.swagger.core.v3:swagger-annotations:2.2.41")
+        implementation("org.flywaydb:flyway-core")
         
         // Boilerplate reduction: @Getter, @Setter, @Builder, @Slf4j
         compileOnly 'org.projectlombok:lombok'
